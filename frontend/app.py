@@ -3,7 +3,7 @@ import json
 import requests
 import streamlit as st
 
-API_DEFAULT = "http://127.0.0.1:8000"
+API_DEFAULT = "https://math-agent-6ha8.onrender.com"
 ACTIVE_WORKFLOW_STATUSES = {"accepted", "queued", "running"}
 TERMINAL_WORKFLOW_STATUSES = {"success", "rejected", "error"}
 REVIEW_ACTIONS = {
