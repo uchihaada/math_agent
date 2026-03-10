@@ -47,7 +47,7 @@ def _get_whisper_model():
     if _whisper_model is None:
         import whisper
 
-        _whisper_model = whisper.load_model("tiny")
+        _whisper_model = whisper.load_model("base")
 
     return _whisper_model
 
@@ -172,6 +172,13 @@ def _ensure_rgb(image_array: np.ndarray):
 
 
 def _build_ocr_variants(image: Image.Image):
+    """
+    Returns 2 variants instead of 4 to cut peak RAM usage by ~50%.
+    - cropped_rgb: clean colour crop, works well for printed/typed math
+    - thresholded: high-contrast binary, works well for handwritten/noisy math
+    upscaled_gray and adaptive are dropped; they added marginal OCR quality
+    but each carried a full beamsearch pass worth of RAM overhead.
+    """
     rgb_image = np.array(image.convert("RGB"))
     gray_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
     cropped = _crop_foreground(gray_image)
@@ -197,20 +204,10 @@ def _build_ocr_variants(image: Image.Image):
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
-    adaptive = cv2.adaptiveThreshold(
-        sharpened,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11,
-    )
 
     return [
         ("cropped_rgb", _ensure_rgb(cropped_rgb)),
-        ("upscaled_gray", _ensure_rgb(upscaled)),
         ("thresholded", _ensure_rgb(thresholded)),
-        ("adaptive", _ensure_rgb(adaptive)),
     ]
 
 
@@ -365,8 +362,7 @@ def _repair_math_ocr_candidates(candidates):
                         )
                     )
                 ),
-            ]
-            ,
+            ],
             OCRRepairOutput,
             "Return a JSON object with exactly these keys: text (string), confidence (number from 0 to 1).",
         )
@@ -386,24 +382,34 @@ def _repair_math_ocr_candidates(candidates):
     }
 
 
+def _run_ocr_on_variant(reader, variant_image, use_beamsearch: bool = False):
+    """
+    Runs EasyOCR on a single variant.
+    - Default: greedy decoder (fast, low RAM — ~3x less than beamsearch)
+    - use_beamsearch=True: only called for a targeted retry on low-confidence results
+    """
+    return reader.readtext(
+        variant_image,
+        detail=1,
+        paragraph=False,
+        allowlist=MATH_ALLOWLIST,
+        decoder="beamsearch" if use_beamsearch else "greedy",
+        canvas_size=2048,   # was 4096 — halves memory for large images
+        mag_ratio=1.5,      # was 2.0 — reduces intermediate array sizes
+        text_threshold=0.5,
+        low_text=0.25,
+        link_threshold=0.2,
+    )
+
+
 def extract_text_from_image(file_bytes: bytes) -> ExtractionResponse:
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     reader = _get_ocr_reader()
     candidates = []
 
     for variant_name, variant_image in _build_ocr_variants(image):
-        results = reader.readtext(
-            variant_image,
-            detail=1,
-            paragraph=False,
-            allowlist=MATH_ALLOWLIST,
-            decoder="beamsearch",
-            canvas_size=4096,
-            mag_ratio=2.0,
-            text_threshold=0.5,
-            low_text=0.25,
-            link_threshold=0.2,
-        )
+        # First pass: greedy decoder — fast and memory-efficient
+        results = _run_ocr_on_variant(reader, variant_image, use_beamsearch=False)
         extracted_text, confidence = _assemble_ocr_text(results)
         corrected_text, applied_corrections = _apply_runtime_corrections(extracted_text)
         score = _score_ocr_candidate(corrected_text, confidence)
@@ -434,12 +440,33 @@ def extract_text_from_image(file_bytes: bytes) -> ExtractionResponse:
     best_candidate = candidates[0]
     raw_confidence = best_candidate["confidence"]
 
+    # Only retry with beamsearch on the single best variant if confidence is low.
+    # This avoids running beamsearch across all variants while still recovering
+    # difficult images.
     if raw_confidence < 0.85 or _looks_like_noisy_math_ocr(best_candidate["text"]):
+        best_variant_image = dict(_build_ocr_variants(image)).get(best_candidate["variant"])
+        if best_variant_image is not None:
+            beam_results = _run_ocr_on_variant(reader, best_variant_image, use_beamsearch=True)
+            beam_text, beam_confidence = _assemble_ocr_text(beam_results)
+            beam_corrected, beam_corrections = _apply_runtime_corrections(beam_text)
+            beam_score = _score_ocr_candidate(beam_corrected, beam_confidence)
+            if beam_corrected and beam_score > best_candidate["score"]:
+                candidates.append(
+                    {
+                        "variant": f"{best_candidate['variant']}_beam",
+                        "text": beam_corrected,
+                        "confidence": beam_confidence,
+                        "applied_corrections": beam_corrections,
+                        "score": beam_score,
+                    }
+                )
+
         repaired_candidate = _repair_math_ocr_candidates(candidates)
         if repaired_candidate is not None:
             candidates.append(repaired_candidate)
-            candidates.sort(key=lambda item: item["score"], reverse=True)
-            best_candidate = candidates[0]
+
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        best_candidate = candidates[0]
 
     alternatives = []
     for candidate in candidates:

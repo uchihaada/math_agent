@@ -1,4 +1,5 @@
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 
 from backend.agents.extraction_agent import extract_text_from_image, transcribe_audio
 from backend.app.workflow import WorkflowController
@@ -23,7 +24,10 @@ async def extract_image(file: UploadFile = File(...)):
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded image is empty.")
 
-    result = extract_text_from_image(file_bytes)
+    # run_in_threadpool moves the CPU-heavy OCR work off the async event loop.
+    # This allows the GC to reclaim memory between variant passes and prevents
+    # the event loop from blocking during the full extraction pipeline.
+    result = await run_in_threadpool(extract_text_from_image, file_bytes)
     return result.model_dump()
 
 
@@ -36,7 +40,7 @@ async def extract_audio(file: UploadFile = File(...)):
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded audio is empty.")
 
-    result = transcribe_audio(file_bytes, file.filename)
+    result = await run_in_threadpool(transcribe_audio, file_bytes, file.filename)
     return result.model_dump()
 
 
