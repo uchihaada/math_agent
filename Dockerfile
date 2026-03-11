@@ -5,7 +5,7 @@ ENV OMP_NUM_THREADS=1
 ENV PYTORCH_NO_CUDA_MEMORY_CACHING=1
 ENV MALLOC_TRIM_THRESHOLD_=100000
 
-RUN apt-get update && apt-get install -y ffmpeg \
+RUN apt-get update && apt-get install -y ffmpeg tesseract-ocr \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
